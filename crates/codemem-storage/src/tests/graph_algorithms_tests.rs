@@ -1,0 +1,1461 @@
+use crate::graph::GraphEngine;
+use codemem_core::{Edge, GraphBackend, GraphNode, NodeKind, RelationshipType};
+use std::collections::{HashMap, HashSet};
+
+fn file_node(id: &str, label: &str) -> GraphNode {
+    GraphNode {
+        id: id.to_string(),
+        kind: NodeKind::File,
+        label: label.to_string(),
+        payload: HashMap::new(),
+        centrality: 0.0,
+        memory_id: None,
+        namespace: None,
+        valid_from: None,
+        valid_to: None,
+    }
+}
+
+fn test_edge(src: &str, dst: &str) -> Edge {
+    Edge {
+        id: format!("{src}->{dst}"),
+        src: src.to_string(),
+        dst: dst.to_string(),
+        relationship: RelationshipType::Contains,
+        weight: 1.0,
+        properties: HashMap::new(),
+        created_at: chrono::Utc::now(),
+        valid_from: None,
+        valid_to: None,
+    }
+}
+
+// ── PageRank Tests ──────────────────────────────────────────────────────
+
+#[test]
+fn pagerank_chain() {
+    // a -> b -> c
+    // c is a sink (dangling node) that redistributes rank uniformly.
+    // Rank flows a -> b -> c, with c accumulating the most. Order: c > b > a.
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_node(file_node("c", "c.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+
+    let ranks = graph.pagerank(0.85, 100, 1e-6);
+    assert_eq!(ranks.len(), 3);
+    assert!(
+        ranks["c"] > ranks["b"],
+        "c ({}) should rank higher than b ({})",
+        ranks["c"],
+        ranks["b"]
+    );
+    assert!(
+        ranks["b"] > ranks["a"],
+        "b ({}) should rank higher than a ({})",
+        ranks["b"],
+        ranks["a"]
+    );
+}
+
+#[test]
+fn pagerank_star() {
+    // a -> b, a -> c, a -> d
+    // b, c, d are dangling nodes that redistribute rank uniformly.
+    // They each receive direct rank from a, plus redistribution.
+    // a only receives redistributed rank from the dangling nodes.
+    // So each leaf should rank higher than the hub.
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_node(file_node("c", "c.rs")).unwrap();
+    graph.add_node(file_node("d", "d.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("a", "c")).unwrap();
+    graph.add_edge(test_edge("a", "d")).unwrap();
+
+    let ranks = graph.pagerank(0.85, 100, 1e-6);
+    assert_eq!(ranks.len(), 4);
+    // Leaves get direct rank from a AND redistribute back uniformly.
+    // b, c, d should be approximately equal and each higher than a.
+    assert!(
+        ranks["b"] > ranks["a"],
+        "b ({}) should rank higher than a ({})",
+        ranks["b"],
+        ranks["a"]
+    );
+    // b, c, d should be approximately equal
+    assert!(
+        (ranks["b"] - ranks["c"]).abs() < 0.01,
+        "b ({}) and c ({}) should be approximately equal",
+        ranks["b"],
+        ranks["c"]
+    );
+}
+
+#[test]
+fn pagerank_empty_graph() {
+    let graph = GraphEngine::new();
+    let ranks = graph.pagerank(0.85, 100, 1e-6);
+    assert!(ranks.is_empty());
+}
+
+#[test]
+fn pagerank_single_node() {
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+
+    let ranks = graph.pagerank(0.85, 100, 1e-6);
+    assert_eq!(ranks.len(), 1);
+    assert!((ranks["a"] - 1.0).abs() < 0.01);
+}
+
+// ── Personalized PageRank Tests ─────────────────────────────────────────
+
+#[test]
+fn personalized_pagerank_cycle_seed_c() {
+    // a -> b -> c -> a (cycle)
+    // Seed on c: c and its neighbors should rank highest
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_node(file_node("c", "c.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+    graph.add_edge(test_edge("c", "a")).unwrap();
+
+    let mut seeds = HashMap::new();
+    seeds.insert("c".to_string(), 1.0);
+
+    let ranks = graph.personalized_pagerank(&seeds, 0.85, 100, 1e-6);
+    assert_eq!(ranks.len(), 3);
+    // c should have highest rank (it's the seed and receives teleport)
+    // a is c's out-neighbor so it should be next
+    assert!(
+        ranks["c"] > ranks["b"],
+        "c ({}) should rank higher than b ({})",
+        ranks["c"],
+        ranks["b"]
+    );
+    assert!(
+        ranks["a"] > ranks["b"],
+        "a ({}) should rank higher than b ({}) since c->a",
+        ranks["a"],
+        ranks["b"]
+    );
+}
+
+#[test]
+fn personalized_pagerank_empty_seeds() {
+    // With no seeds, should fall back to uniform (same as regular pagerank)
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+
+    let seeds = HashMap::new();
+    let ppr = graph.personalized_pagerank(&seeds, 0.85, 100, 1e-6);
+    let pr = graph.pagerank(0.85, 100, 1e-6);
+
+    // Should be approximately equal
+    assert!((ppr["a"] - pr["a"]).abs() < 0.01);
+    assert!((ppr["b"] - pr["b"]).abs() < 0.01);
+}
+
+// ── Louvain Community Detection Tests ───────────────────────────────────
+
+#[test]
+fn louvain_two_disconnected_cliques() {
+    // Clique 1: a <-> b <-> c <-> a
+    // Clique 2: d <-> e <-> f <-> d
+    let mut graph = GraphEngine::new();
+    for id in &["a", "b", "c", "d", "e", "f"] {
+        graph.add_node(file_node(id, &format!("{id}.rs"))).unwrap();
+    }
+    // Clique 1
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "a")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+    graph.add_edge(test_edge("c", "b")).unwrap();
+    graph.add_edge(test_edge("a", "c")).unwrap();
+    graph.add_edge(test_edge("c", "a")).unwrap();
+    // Clique 2
+    graph.add_edge(test_edge("d", "e")).unwrap();
+    graph.add_edge(test_edge("e", "d")).unwrap();
+    graph.add_edge(test_edge("e", "f")).unwrap();
+    graph.add_edge(test_edge("f", "e")).unwrap();
+    graph.add_edge(test_edge("d", "f")).unwrap();
+    graph.add_edge(test_edge("f", "d")).unwrap();
+
+    let communities = graph.louvain_communities(1.0);
+    assert_eq!(
+        communities.len(),
+        2,
+        "Expected 2 communities, got {}: {:?}",
+        communities.len(),
+        communities
+    );
+    // Each community should have 3 nodes
+    assert_eq!(communities[0].len(), 3);
+    assert_eq!(communities[1].len(), 3);
+    // Check that each clique is in a separate community
+    let comm0_set: HashSet<&str> = communities[0].iter().map(|s| s.as_str()).collect();
+    let has_abc = comm0_set.contains("a") && comm0_set.contains("b") && comm0_set.contains("c");
+    let has_def = comm0_set.contains("d") && comm0_set.contains("e") && comm0_set.contains("f");
+    assert!(
+        has_abc || has_def,
+        "First community should be one of the cliques: {:?}",
+        communities[0]
+    );
+}
+
+#[test]
+fn louvain_empty_graph() {
+    let graph = GraphEngine::new();
+    let communities = graph.louvain_communities(1.0);
+    assert!(communities.is_empty());
+}
+
+#[test]
+fn louvain_single_node() {
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    let communities = graph.louvain_communities(1.0);
+    assert_eq!(communities.len(), 1);
+    assert_eq!(communities[0], vec!["a"]);
+}
+
+// ── Betweenness Centrality Tests ────────────────────────────────────────
+
+#[test]
+fn betweenness_chain_middle_highest() {
+    // a -> b -> c
+    // b is on the shortest path from a to c, so it should have highest betweenness
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_node(file_node("c", "c.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+
+    let bc = graph.betweenness_centrality();
+    assert_eq!(bc.len(), 3);
+    assert!(
+        bc["b"] > bc["a"],
+        "b ({}) should have higher betweenness than a ({})",
+        bc["b"],
+        bc["a"]
+    );
+    assert!(
+        bc["b"] > bc["c"],
+        "b ({}) should have higher betweenness than c ({})",
+        bc["b"],
+        bc["c"]
+    );
+    // a and c should have 0 betweenness (they are endpoints)
+    assert!(
+        bc["a"].abs() < f64::EPSILON,
+        "a should have 0 betweenness, got {}",
+        bc["a"]
+    );
+    assert!(
+        bc["c"].abs() < f64::EPSILON,
+        "c should have 0 betweenness, got {}",
+        bc["c"]
+    );
+}
+
+#[test]
+fn betweenness_empty_graph() {
+    let graph = GraphEngine::new();
+    let bc = graph.betweenness_centrality();
+    assert!(bc.is_empty());
+}
+
+#[test]
+fn betweenness_two_nodes() {
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+
+    let bc = graph.betweenness_centrality();
+    assert_eq!(bc.len(), 2);
+    assert!((bc["a"]).abs() < f64::EPSILON);
+    assert!((bc["b"]).abs() < f64::EPSILON);
+}
+
+// ── Strongly Connected Components Tests ─────────────────────────────────
+
+#[test]
+fn scc_cycle_all_in_one() {
+    // a -> b -> c -> a: all three should be in one SCC
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_node(file_node("c", "c.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+    graph.add_edge(test_edge("c", "a")).unwrap();
+
+    let sccs = graph.strongly_connected_components();
+    assert_eq!(
+        sccs.len(),
+        1,
+        "Expected 1 SCC, got {}: {:?}",
+        sccs.len(),
+        sccs
+    );
+    assert_eq!(sccs[0], vec!["a", "b", "c"]);
+}
+
+#[test]
+fn scc_chain_each_separate() {
+    // a -> b -> c: no cycles, each node is its own SCC
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_node(file_node("c", "c.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+
+    let sccs = graph.strongly_connected_components();
+    assert_eq!(
+        sccs.len(),
+        3,
+        "Expected 3 SCCs, got {}: {:?}",
+        sccs.len(),
+        sccs
+    );
+}
+
+#[test]
+fn scc_empty_graph() {
+    let graph = GraphEngine::new();
+    let sccs = graph.strongly_connected_components();
+    assert!(sccs.is_empty());
+}
+
+// ── Topological Sort Tests ──────────────────────────────────────────────
+
+#[test]
+fn topological_layers_dag() {
+    // a -> b, a -> c, b -> d, c -> d
+    // Layer 0: [a], Layer 1: [b, c], Layer 2: [d]
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_node(file_node("c", "c.rs")).unwrap();
+    graph.add_node(file_node("d", "d.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("a", "c")).unwrap();
+    graph.add_edge(test_edge("b", "d")).unwrap();
+    graph.add_edge(test_edge("c", "d")).unwrap();
+
+    let layers = graph.topological_layers();
+    assert_eq!(
+        layers.len(),
+        3,
+        "Expected 3 layers, got {}: {:?}",
+        layers.len(),
+        layers
+    );
+    assert_eq!(layers[0], vec!["a"]);
+    assert_eq!(layers[1], vec!["b", "c"]); // sorted within layer
+    assert_eq!(layers[2], vec!["d"]);
+}
+
+#[test]
+fn topological_layers_with_cycle() {
+    // a -> b -> c -> b (cycle between b and c), a -> d
+    // SCCs: {a}, {b, c}, {d}
+    // After condensation: {a} -> {b,c} and {a} -> {d}
+    // Layer 0: [a], Layer 1: [b, c, d] (b and c condensed, d also depends on a)
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_node(file_node("c", "c.rs")).unwrap();
+    graph.add_node(file_node("d", "d.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+    graph.add_edge(test_edge("c", "b")).unwrap();
+    graph.add_edge(test_edge("a", "d")).unwrap();
+
+    let layers = graph.topological_layers();
+    assert_eq!(
+        layers.len(),
+        2,
+        "Expected 2 layers, got {}: {:?}",
+        layers.len(),
+        layers
+    );
+    assert_eq!(layers[0], vec!["a"]);
+    // Layer 1 should contain b, c (from the cycle SCC) and d
+    assert!(layers[1].contains(&"b".to_string()));
+    assert!(layers[1].contains(&"c".to_string()));
+    assert!(layers[1].contains(&"d".to_string()));
+}
+
+#[test]
+fn topological_layers_empty_graph() {
+    let graph = GraphEngine::new();
+    let layers = graph.topological_layers();
+    assert!(layers.is_empty());
+}
+
+#[test]
+fn topological_layers_single_node() {
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    let layers = graph.topological_layers();
+    assert_eq!(layers.len(), 1);
+    assert_eq!(layers[0], vec!["a"]);
+}
+
+// ── Subgraph Top-N Tests ──────────────────────────────────────────────
+
+fn namespaced_node(id: &str, label: &str, namespace: Option<&str>, kind: NodeKind) -> GraphNode {
+    GraphNode {
+        id: id.to_string(),
+        kind,
+        label: label.to_string(),
+        payload: HashMap::new(),
+        centrality: 0.0,
+        memory_id: None,
+        namespace: namespace.map(|s| s.to_string()),
+        valid_from: None,
+        valid_to: None,
+    }
+}
+
+#[test]
+fn subgraph_top_n_basic() {
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_node(file_node("c", "c.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+    graph.add_edge(test_edge("a", "c")).unwrap();
+
+    // Compute centrality so nodes have different scores
+    graph.compute_centrality();
+
+    // Take top 2 nodes by centrality
+    let (nodes, edges) = graph.subgraph_top_n(2, None, None);
+    assert_eq!(nodes.len(), 2);
+
+    // All returned edges should connect top-N nodes only
+    let top_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    for edge in &edges {
+        assert!(top_ids.contains(edge.src.as_str()));
+        assert!(top_ids.contains(edge.dst.as_str()));
+    }
+}
+
+#[test]
+fn subgraph_top_n_with_namespace_filter() {
+    let mut graph = GraphEngine::new();
+    graph
+        .add_node(namespaced_node("a", "a.rs", Some("proj1"), NodeKind::File))
+        .unwrap();
+    graph
+        .add_node(namespaced_node("b", "b.rs", Some("proj1"), NodeKind::File))
+        .unwrap();
+    graph
+        .add_node(namespaced_node("c", "c.rs", Some("proj2"), NodeKind::File))
+        .unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("a", "c")).unwrap();
+    graph.compute_centrality();
+
+    let (nodes, _edges) = graph.subgraph_top_n(10, Some("proj1"), None);
+    assert_eq!(nodes.len(), 2);
+    for node in &nodes {
+        assert_eq!(node.namespace.as_deref(), Some("proj1"));
+    }
+}
+
+#[test]
+fn subgraph_top_n_with_kind_filter() {
+    let mut graph = GraphEngine::new();
+    graph
+        .add_node(namespaced_node("a", "a.rs", None, NodeKind::File))
+        .unwrap();
+    graph
+        .add_node(namespaced_node("b", "do_stuff", None, NodeKind::Function))
+        .unwrap();
+    graph
+        .add_node(namespaced_node("c", "MyClass", None, NodeKind::Class))
+        .unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("a", "c")).unwrap();
+    graph.compute_centrality();
+
+    let (nodes, _edges) =
+        graph.subgraph_top_n(10, None, Some(&[NodeKind::Function, NodeKind::Class]));
+    assert_eq!(nodes.len(), 2);
+    for node in &nodes {
+        assert!(
+            node.kind == NodeKind::Function || node.kind == NodeKind::Class,
+            "unexpected kind: {:?}",
+            node.kind
+        );
+    }
+}
+
+#[test]
+fn subgraph_top_n_empty_graph() {
+    let graph = GraphEngine::new();
+    let (nodes, edges) = graph.subgraph_top_n(5, None, None);
+    assert!(nodes.is_empty());
+    assert!(edges.is_empty());
+}
+
+#[test]
+fn subgraph_top_n_n_larger_than_graph() {
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.compute_centrality();
+
+    let (nodes, edges) = graph.subgraph_top_n(100, None, None);
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(edges.len(), 1);
+}
+
+#[test]
+fn subgraph_top_n_edges_only_between_top() {
+    // a -> b -> c -> d, take top 2 (b and c have highest centrality)
+    // Only edge b->c should be returned
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    graph.add_node(file_node("b", "b.rs")).unwrap();
+    graph.add_node(file_node("c", "c.rs")).unwrap();
+    graph.add_node(file_node("d", "d.rs")).unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+    graph.add_edge(test_edge("c", "d")).unwrap();
+    graph.compute_centrality();
+
+    let (nodes, edges) = graph.subgraph_top_n(2, None, None);
+    assert_eq!(nodes.len(), 2);
+
+    let top_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    for edge in &edges {
+        assert!(
+            top_ids.contains(edge.src.as_str()) && top_ids.contains(edge.dst.as_str()),
+            "edge {}-->{} should only connect top-N nodes",
+            edge.src,
+            edge.dst
+        );
+    }
+}
+
+// ── Subgraph Expansion Tests ─────────────────────────────────────────
+
+fn typed_edge(src: &str, dst: &str, rel: RelationshipType) -> Edge {
+    Edge {
+        id: format!("{rel}:{src}->{dst}"),
+        src: src.to_string(),
+        dst: dst.to_string(),
+        relationship: rel,
+        weight: 1.0,
+        properties: HashMap::new(),
+        created_at: chrono::Utc::now(),
+        valid_from: None,
+        valid_to: None,
+    }
+}
+
+#[test]
+fn subgraph_top_n_expands_calls_targets() {
+    // Build a graph where sym_target is only reachable via a CALLS edge
+    // from a high-centrality hub, so it wouldn't make top-N alone.
+    // hub <--CONTAINS-- file_a, hub <--CONTAINS-- file_b (hub has high centrality)
+    // hub --CALLS--> sym_target (sym_target is a leaf with low centrality)
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("file_a", "a.rs")).unwrap();
+    graph.add_node(file_node("file_b", "b.rs")).unwrap();
+    graph
+        .add_node(namespaced_node("hub", "hub_fn", None, NodeKind::Function))
+        .unwrap();
+    graph
+        .add_node(namespaced_node(
+            "sym_target",
+            "target_fn",
+            None,
+            NodeKind::Function,
+        ))
+        .unwrap();
+    // Two CONTAINS edges into hub → high centrality
+    graph
+        .add_edge(typed_edge("file_a", "hub", RelationshipType::Contains))
+        .unwrap();
+    graph
+        .add_edge(typed_edge("file_b", "hub", RelationshipType::Contains))
+        .unwrap();
+    // CALLS edge from hub to target
+    graph
+        .add_edge(typed_edge("hub", "sym_target", RelationshipType::Calls))
+        .unwrap();
+    graph.compute_centrality();
+
+    // Top 3 by centrality: file_a, file_b, hub (sym_target has lowest).
+    // Expansion should pull sym_target in via the CALLS edge.
+    let (nodes, edges) = graph.subgraph_top_n(3, None, None);
+
+    let node_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(
+        node_ids.contains("sym_target"),
+        "sym_target should be pulled in by CALLS expansion, got: {:?}",
+        node_ids
+    );
+
+    let has_calls = edges
+        .iter()
+        .any(|e| e.relationship == RelationshipType::Calls);
+    assert!(has_calls, "CALLS edge should be in the result");
+}
+
+#[test]
+fn subgraph_top_n_expands_imports_targets() {
+    // Build a graph with enough nodes that sym_target is clearly lowest centrality.
+    // hub is a high-centrality connector; sym_target is an isolated leaf.
+    let mut graph = GraphEngine::new();
+    for i in 0..4 {
+        graph
+            .add_node(file_node(&format!("file_{i}"), &format!("{i}.rs")))
+            .unwrap();
+    }
+    graph
+        .add_node(namespaced_node("hub", "hub_mod", None, NodeKind::Module))
+        .unwrap();
+    graph
+        .add_node(namespaced_node(
+            "sym_target",
+            "imported_mod",
+            None,
+            NodeKind::Module,
+        ))
+        .unwrap();
+    // All files point to hub → hub has highest centrality
+    for i in 0..4 {
+        graph
+            .add_edge(typed_edge(
+                &format!("file_{i}"),
+                "hub",
+                RelationshipType::Contains,
+            ))
+            .unwrap();
+    }
+    // Also connect files to each other to boost their centrality above sym_target
+    graph
+        .add_edge(typed_edge("file_0", "file_1", RelationshipType::Contains))
+        .unwrap();
+    graph
+        .add_edge(typed_edge("file_2", "file_3", RelationshipType::Contains))
+        .unwrap();
+    // hub --IMPORTS--> sym_target (only one incoming edge for sym_target)
+    graph
+        .add_edge(typed_edge("hub", "sym_target", RelationshipType::Imports))
+        .unwrap();
+    graph.compute_centrality();
+
+    // Take top 5 (all files + hub). sym_target should be excluded from top-N
+    // but pulled in via expansion.
+    let (nodes, edges) = graph.subgraph_top_n(5, None, None);
+    let node_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(
+        node_ids.contains("sym_target"),
+        "sym_target should be pulled in by IMPORTS expansion, got: {:?}",
+        node_ids
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.relationship == RelationshipType::Imports),
+        "IMPORTS edge should be in the result"
+    );
+}
+
+#[test]
+fn subgraph_top_n_expansion_respects_kind_filter() {
+    // sym_a --CALLS--> sym_b (Function), sym_a --CALLS--> cls_c (Class)
+    // With kind filter [Function], expansion should pull sym_b but NOT cls_c.
+    let mut graph = GraphEngine::new();
+    graph
+        .add_node(namespaced_node("sym_a", "fn_a", None, NodeKind::Function))
+        .unwrap();
+    graph
+        .add_node(namespaced_node("sym_b", "fn_b", None, NodeKind::Function))
+        .unwrap();
+    graph
+        .add_node(namespaced_node("cls_c", "MyClass", None, NodeKind::Class))
+        .unwrap();
+    graph
+        .add_edge(typed_edge("sym_a", "sym_b", RelationshipType::Calls))
+        .unwrap();
+    graph
+        .add_edge(typed_edge("sym_a", "cls_c", RelationshipType::Calls))
+        .unwrap();
+    graph.compute_centrality();
+
+    let (nodes, _edges) = graph.subgraph_top_n(1, None, Some(&[NodeKind::Function]));
+    let node_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(
+        !node_ids.contains("cls_c"),
+        "Class node should NOT be pulled in when kind filter is [Function]"
+    );
+}
+
+#[test]
+fn subgraph_top_n_expansion_respects_namespace_filter() {
+    let mut graph = GraphEngine::new();
+    graph
+        .add_node(namespaced_node(
+            "sym_a",
+            "fn_a",
+            Some("proj1"),
+            NodeKind::Function,
+        ))
+        .unwrap();
+    graph
+        .add_node(namespaced_node(
+            "sym_b",
+            "fn_b",
+            Some("proj1"),
+            NodeKind::Function,
+        ))
+        .unwrap();
+    graph
+        .add_node(namespaced_node(
+            "sym_c",
+            "fn_c",
+            Some("proj2"),
+            NodeKind::Function,
+        ))
+        .unwrap();
+    // a calls both b (proj1) and c (proj2)
+    graph
+        .add_edge(typed_edge("sym_a", "sym_b", RelationshipType::Calls))
+        .unwrap();
+    graph
+        .add_edge(typed_edge("sym_a", "sym_c", RelationshipType::Calls))
+        .unwrap();
+    graph.compute_centrality();
+
+    // Take top 2 from proj1 namespace — should get sym_a + sym_b (both proj1),
+    // but NOT sym_c (proj2) even though sym_a calls it.
+    let (nodes, _edges) = graph.subgraph_top_n(2, Some("proj1"), None);
+    let node_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    assert!(
+        !node_ids.contains("sym_c"),
+        "proj2 node should NOT be pulled in when namespace filter is proj1"
+    );
+    // Both proj1 nodes should be present (either via top-N or expansion)
+    assert!(node_ids.contains("sym_a"), "sym_a should be in result");
+    assert!(node_ids.contains("sym_b"), "sym_b should be in result");
+}
+
+#[test]
+fn subgraph_top_n_expansion_skips_contains() {
+    // Expansion should NOT pull in nodes via CONTAINS edges (structural).
+    // Build: file_a --CONTAINS--> sym_a, file_a --CONTAINS--> sym_b
+    // Top-1 has the highest centrality node. Whichever is NOT in top-1
+    // should NOT be pulled in via expansion (CONTAINS is skipped).
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("file_a", "a.rs")).unwrap();
+    graph
+        .add_node(namespaced_node("sym_a", "fn_a", None, NodeKind::Function))
+        .unwrap();
+    graph
+        .add_node(namespaced_node("sym_b", "fn_b", None, NodeKind::Function))
+        .unwrap();
+    graph
+        .add_edge(typed_edge("file_a", "sym_a", RelationshipType::Contains))
+        .unwrap();
+    graph
+        .add_edge(typed_edge("file_a", "sym_b", RelationshipType::Contains))
+        .unwrap();
+    graph.compute_centrality();
+
+    // Top 1 = file_a (has 2 outgoing CONTAINS edges, highest degree).
+    // Neither sym_a nor sym_b should be expanded since CONTAINS is structural.
+    let (nodes, _edges) = graph.subgraph_top_n(1, None, None);
+    assert_eq!(
+        nodes.len(),
+        1,
+        "only 1 node from top-N, no expansion via CONTAINS"
+    );
+}
+
+#[test]
+fn subgraph_top_n_expansion_budget_bounded() {
+    // Create a hub node with many CALLS targets — should not exceed 20% budget.
+    let mut graph = GraphEngine::new();
+    graph
+        .add_node(namespaced_node("hub", "hub_fn", None, NodeKind::Function))
+        .unwrap();
+    // n=5, budget = 5/5 = 1
+    for i in 0..10 {
+        let id = format!("target_{i}");
+        graph
+            .add_node(namespaced_node(&id, &id, None, NodeKind::Function))
+            .unwrap();
+        graph
+            .add_edge(typed_edge("hub", &id, RelationshipType::Calls))
+            .unwrap();
+    }
+    graph.compute_centrality();
+
+    let (nodes, _edges) = graph.subgraph_top_n(5, None, None);
+    // 5 from top-N + at most 1 from expansion (budget = 5/5 = 1)
+    assert!(
+        nodes.len() <= 6,
+        "expansion should respect 20% budget, got {} nodes",
+        nodes.len()
+    );
+}
+
+// ── Louvain With Assignment Tests ─────────────────────────────────────
+
+#[test]
+fn louvain_with_assignment_two_cliques() {
+    let mut graph = GraphEngine::new();
+    for id in &["a", "b", "c", "d", "e", "f"] {
+        graph.add_node(file_node(id, &format!("{id}.rs"))).unwrap();
+    }
+    // Clique 1: a <-> b <-> c <-> a
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "a")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+    graph.add_edge(test_edge("c", "b")).unwrap();
+    graph.add_edge(test_edge("a", "c")).unwrap();
+    graph.add_edge(test_edge("c", "a")).unwrap();
+    // Clique 2: d <-> e <-> f <-> d
+    graph.add_edge(test_edge("d", "e")).unwrap();
+    graph.add_edge(test_edge("e", "d")).unwrap();
+    graph.add_edge(test_edge("e", "f")).unwrap();
+    graph.add_edge(test_edge("f", "e")).unwrap();
+    graph.add_edge(test_edge("d", "f")).unwrap();
+    graph.add_edge(test_edge("f", "d")).unwrap();
+
+    let assignment = graph.louvain_with_assignment(1.0);
+    assert_eq!(assignment.len(), 6);
+
+    // All nodes in clique 1 should share the same community
+    assert_eq!(assignment["a"], assignment["b"]);
+    assert_eq!(assignment["b"], assignment["c"]);
+
+    // All nodes in clique 2 should share the same community
+    assert_eq!(assignment["d"], assignment["e"]);
+    assert_eq!(assignment["e"], assignment["f"]);
+
+    // The two cliques should be in different communities
+    assert_ne!(assignment["a"], assignment["d"]);
+}
+
+#[test]
+fn louvain_barbell_graph() {
+    // Barbell graph: two cliques connected by a single edge (bridge).
+    // Clique 1: a <-> b <-> c <-> a (fully connected)
+    // Clique 2: d <-> e <-> f <-> d (fully connected)
+    // Bridge: c -> d, d -> c
+    // Louvain should detect 2 communities.
+    let mut graph = GraphEngine::new();
+    for id in &["a", "b", "c", "d", "e", "f"] {
+        graph.add_node(file_node(id, &format!("{id}.rs"))).unwrap();
+    }
+    // Clique 1
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "a")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+    graph.add_edge(test_edge("c", "b")).unwrap();
+    graph.add_edge(test_edge("a", "c")).unwrap();
+    graph.add_edge(test_edge("c", "a")).unwrap();
+    // Clique 2
+    graph.add_edge(test_edge("d", "e")).unwrap();
+    graph.add_edge(test_edge("e", "d")).unwrap();
+    graph.add_edge(test_edge("e", "f")).unwrap();
+    graph.add_edge(test_edge("f", "e")).unwrap();
+    graph.add_edge(test_edge("d", "f")).unwrap();
+    graph.add_edge(test_edge("f", "d")).unwrap();
+    // Bridge between cliques (single bidirectional edge)
+    let bridge1 = Edge {
+        id: "bridge_c_d".to_string(),
+        src: "c".to_string(),
+        dst: "d".to_string(),
+        relationship: RelationshipType::Contains,
+        weight: 1.0,
+        properties: HashMap::new(),
+        created_at: chrono::Utc::now(),
+        valid_from: None,
+        valid_to: None,
+    };
+    let bridge2 = Edge {
+        id: "bridge_d_c".to_string(),
+        src: "d".to_string(),
+        dst: "c".to_string(),
+        relationship: RelationshipType::Contains,
+        weight: 1.0,
+        properties: HashMap::new(),
+        created_at: chrono::Utc::now(),
+        valid_from: None,
+        valid_to: None,
+    };
+    graph.add_edge(bridge1).unwrap();
+    graph.add_edge(bridge2).unwrap();
+
+    let communities = graph.louvain_communities(1.0);
+    assert_eq!(
+        communities.len(),
+        2,
+        "Barbell graph should have 2 communities, got {}: {:?}",
+        communities.len(),
+        communities
+    );
+
+    // Each community should have 3 nodes
+    assert_eq!(communities[0].len(), 3);
+    assert_eq!(communities[1].len(), 3);
+
+    // Check that a,b,c are in one community and d,e,f in another
+    let comm0_set: HashSet<&str> = communities[0].iter().map(|s| s.as_str()).collect();
+    let has_abc = comm0_set.contains("a") && comm0_set.contains("b") && comm0_set.contains("c");
+    let has_def = comm0_set.contains("d") && comm0_set.contains("e") && comm0_set.contains("f");
+    assert!(
+        has_abc || has_def,
+        "Communities should split at the bridge: {:?}",
+        communities
+    );
+}
+
+#[test]
+fn louvain_with_assignment_empty_graph() {
+    let graph = GraphEngine::new();
+    let assignment = graph.louvain_with_assignment(1.0);
+    assert!(assignment.is_empty());
+}
+
+#[test]
+fn louvain_with_assignment_single_node() {
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("a", "a.rs")).unwrap();
+    let assignment = graph.louvain_with_assignment(1.0);
+    assert_eq!(assignment.len(), 1);
+    assert!(assignment.contains_key("a"));
+}
+
+#[test]
+fn louvain_heritage_edges_reduce_coupling() {
+    // Two clusters connected by a heritage (Inherits) bridge.
+    // The bridge weight is high enough that WITHOUT the 0.5x heritage
+    // multiplier, Louvain merges everything into one community.
+    // WITH the multiplier, the effective bridge weight drops below the
+    // threshold and the clusters stay separate.
+    //
+    // Cluster 1: a <-> b  (Contains, internal undirected weight = 2.0)
+    // Cluster 2: c <-> d  (Contains, internal undirected weight = 2.0)
+    // Bridge: b --Inherits--> c  weight=3.0
+    //         c --Inherits--> b  weight=3.0
+    //   Without 0.5x: bridge undirected = 6.0 (>> internal 2.0), merges.
+    //   With 0.5x:    bridge undirected = 3.0, still > 2.0 but modularity
+    //                 penalty for merging outweighs the gain => stays split.
+    let mut graph = GraphEngine::new();
+    for id in &["a", "b", "c", "d"] {
+        graph.add_node(file_node(id, &format!("{id}.rs"))).unwrap();
+    }
+    // Cluster 1: a <-> b (Contains edges, 1.0x multiplier)
+    graph
+        .add_edge(Edge {
+            id: "ab".to_string(),
+            src: "a".to_string(),
+            dst: "b".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    graph
+        .add_edge(Edge {
+            id: "ba".to_string(),
+            src: "b".to_string(),
+            dst: "a".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    // Cluster 2: c <-> d (Contains edges, 1.0x multiplier)
+    graph
+        .add_edge(Edge {
+            id: "cd".to_string(),
+            src: "c".to_string(),
+            dst: "d".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    graph
+        .add_edge(Edge {
+            id: "dc".to_string(),
+            src: "d".to_string(),
+            dst: "c".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    // Heritage bridge: b <-> c with Inherits, weight 3.0 each direction.
+    graph
+        .add_edge(Edge {
+            id: "heritage_b_c".to_string(),
+            src: "b".to_string(),
+            dst: "c".to_string(),
+            relationship: RelationshipType::Inherits,
+            weight: 3.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    graph
+        .add_edge(Edge {
+            id: "heritage_c_b".to_string(),
+            src: "c".to_string(),
+            dst: "b".to_string(),
+            relationship: RelationshipType::Inherits,
+            weight: 3.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+
+    let communities = graph.louvain_communities(1.0);
+    assert_eq!(
+        communities.len(),
+        2,
+        "Heritage bridge with 0.5x multiplier should keep clusters separate, got {}: {:?}",
+        communities.len(),
+        communities
+    );
+
+    // Verify correct split: {a,b} and {c,d}
+    let comm0_set: HashSet<&str> = communities[0].iter().map(|s| s.as_str()).collect();
+    let has_ab = comm0_set.contains("a") && comm0_set.contains("b");
+    let has_cd = comm0_set.contains("c") && comm0_set.contains("d");
+    assert!(
+        has_ab || has_cd,
+        "Heritage-bridged clusters should stay separate: {:?}",
+        communities
+    );
+}
+
+#[test]
+fn louvain_non_heritage_bridge_merges_clusters() {
+    // Same topology as heritage test but with Contains (1.0x multiplier).
+    // The strong bridge should merge everything into one community,
+    // proving the heritage test is testing the multiplier.
+    let mut graph = GraphEngine::new();
+    for id in &["a", "b", "c", "d"] {
+        graph.add_node(file_node(id, &format!("{id}.rs"))).unwrap();
+    }
+    graph
+        .add_edge(Edge {
+            id: "ab".to_string(),
+            src: "a".to_string(),
+            dst: "b".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    graph
+        .add_edge(Edge {
+            id: "ba".to_string(),
+            src: "b".to_string(),
+            dst: "a".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    graph
+        .add_edge(Edge {
+            id: "cd".to_string(),
+            src: "c".to_string(),
+            dst: "d".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    graph
+        .add_edge(Edge {
+            id: "dc".to_string(),
+            src: "d".to_string(),
+            dst: "c".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    // Same bridge but with Contains (no multiplier) instead of Inherits
+    graph
+        .add_edge(Edge {
+            id: "bridge_b_c".to_string(),
+            src: "b".to_string(),
+            dst: "c".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 3.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    graph
+        .add_edge(Edge {
+            id: "bridge_c_b".to_string(),
+            src: "c".to_string(),
+            dst: "b".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 3.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+
+    let communities = graph.louvain_communities(1.0);
+    assert_eq!(
+        communities.len(),
+        1,
+        "Non-heritage bridge should merge clusters into one community, got {}: {:?}",
+        communities.len(),
+        communities
+    );
+}
+
+#[test]
+fn louvain_extends_and_implements_also_reduced() {
+    // Verify Extends and Implements also get the 0.5x multiplier.
+    // Same topology as heritage test.
+    let mut graph = GraphEngine::new();
+    for id in &["a", "b", "c", "d"] {
+        graph.add_node(file_node(id, &format!("{id}.rs"))).unwrap();
+    }
+    graph
+        .add_edge(Edge {
+            id: "ab".to_string(),
+            src: "a".to_string(),
+            dst: "b".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    graph
+        .add_edge(Edge {
+            id: "ba".to_string(),
+            src: "b".to_string(),
+            dst: "a".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    graph
+        .add_edge(Edge {
+            id: "cd".to_string(),
+            src: "c".to_string(),
+            dst: "d".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    graph
+        .add_edge(Edge {
+            id: "dc".to_string(),
+            src: "d".to_string(),
+            dst: "c".to_string(),
+            relationship: RelationshipType::Contains,
+            weight: 1.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    // Bridge with Extends one direction, Implements the other
+    graph
+        .add_edge(Edge {
+            id: "extends_b_c".to_string(),
+            src: "b".to_string(),
+            dst: "c".to_string(),
+            relationship: RelationshipType::Extends,
+            weight: 3.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+    graph
+        .add_edge(Edge {
+            id: "implements_c_b".to_string(),
+            src: "c".to_string(),
+            dst: "b".to_string(),
+            relationship: RelationshipType::Implements,
+            weight: 3.0,
+            properties: HashMap::new(),
+            created_at: chrono::Utc::now(),
+            valid_from: None,
+            valid_to: None,
+        })
+        .unwrap();
+
+    let communities = graph.louvain_communities(1.0);
+    assert_eq!(
+        communities.len(),
+        2,
+        "Extends/Implements bridge should keep clusters separate, got {}: {:?}",
+        communities.len(),
+        communities
+    );
+}
+
+#[test]
+fn louvain_with_assignment_all_nodes_present() {
+    let mut graph = GraphEngine::new();
+    for id in &["a", "b", "c"] {
+        graph.add_node(file_node(id, &format!("{id}.rs"))).unwrap();
+    }
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("b", "c")).unwrap();
+
+    let assignment = graph.louvain_with_assignment(1.0);
+    assert_eq!(assignment.len(), 3);
+    assert!(assignment.contains_key("a"));
+    assert!(assignment.contains_key("b"));
+    assert!(assignment.contains_key("c"));
+}
+
+// ── label_community Tests ──────────────────────────────────────────────
+
+fn file_node_with_path(id: &str, label: &str, file_path: &str) -> GraphNode {
+    let mut payload = HashMap::new();
+    payload.insert(
+        "file_path".to_string(),
+        serde_json::Value::String(file_path.to_string()),
+    );
+    GraphNode {
+        id: id.to_string(),
+        kind: NodeKind::File,
+        label: label.to_string(),
+        payload,
+        centrality: 0.0,
+        memory_id: None,
+        namespace: None,
+        valid_from: None,
+        valid_to: None,
+    }
+}
+
+#[test]
+fn label_community_single_directory() {
+    let mut graph = GraphEngine::new();
+    graph
+        .add_node(file_node_with_path("a", "login.rs", "src/auth/login.rs"))
+        .unwrap();
+    graph
+        .add_node(file_node_with_path(
+            "b",
+            "session.rs",
+            "src/auth/session.rs",
+        ))
+        .unwrap();
+    graph
+        .add_node(file_node_with_path("c", "token.rs", "src/auth/token.rs"))
+        .unwrap();
+
+    let label = graph.label_community(&["a", "b", "c"]);
+    assert_eq!(label, "auth");
+}
+
+#[test]
+fn label_community_mixed_directories() {
+    let mut graph = GraphEngine::new();
+    graph
+        .add_node(file_node_with_path("a", "login.rs", "src/auth/login.rs"))
+        .unwrap();
+    graph
+        .add_node(file_node_with_path(
+            "b",
+            "session.rs",
+            "src/auth/session.rs",
+        ))
+        .unwrap();
+    graph
+        .add_node(file_node_with_path(
+            "c",
+            "cors.rs",
+            "src/middleware/cors.rs",
+        ))
+        .unwrap();
+
+    let label = graph.label_community(&["a", "b", "c"]);
+    // "auth" has 2 members, "middleware" has 1 → "auth+middleware"
+    assert_eq!(label, "auth+middleware");
+}
+
+#[test]
+fn label_community_no_file_paths() {
+    let mut graph = GraphEngine::new();
+    graph.add_node(file_node("x", "x.rs")).unwrap();
+    graph.add_node(file_node("y", "y.rs")).unwrap();
+
+    let label = graph.label_community(&["x", "y"]);
+    assert_eq!(label, "unknown");
+}
+
+// ── PageRank for Namespace Tests ────────────────────────────────────────
+
+#[test]
+fn pagerank_for_namespace_isolated_namespaces() {
+    // proj1: a -> b
+    // proj2: c -> d
+    // PageRank for proj1 should only include a and b
+    let mut graph = GraphEngine::new();
+    graph
+        .add_node(namespaced_node("a", "a.rs", Some("proj1"), NodeKind::File))
+        .unwrap();
+    graph
+        .add_node(namespaced_node("b", "b.rs", Some("proj1"), NodeKind::File))
+        .unwrap();
+    graph
+        .add_node(namespaced_node("c", "c.rs", Some("proj2"), NodeKind::File))
+        .unwrap();
+    graph
+        .add_node(namespaced_node("d", "d.rs", Some("proj2"), NodeKind::File))
+        .unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.add_edge(test_edge("c", "d")).unwrap();
+    graph.compute_centrality();
+
+    // PageRank for proj1 should only include a and b
+    let ranks = graph.pagerank_for_namespace("proj1", 0.85, 100, 1e-6);
+    assert_eq!(ranks.len(), 2);
+    assert!(ranks.contains_key("a"));
+    assert!(ranks.contains_key("b"));
+    assert!(!ranks.contains_key("c"));
+    assert!(!ranks.contains_key("d"));
+
+    // PageRank for proj2 should only include c and d
+    let ranks = graph.pagerank_for_namespace("proj2", 0.85, 100, 1e-6);
+    assert_eq!(ranks.len(), 2);
+    assert!(!ranks.contains_key("a"));
+    assert!(!ranks.contains_key("b"));
+    assert!(ranks.contains_key("c"));
+    assert!(ranks.contains_key("d"));
+}
+
+#[test]
+fn pagerank_for_namespace_empty_namespace() {
+    // Graph with nodes in proj1, query for non-existent namespace
+    let mut graph = GraphEngine::new();
+    graph
+        .add_node(namespaced_node("a", "a.rs", Some("proj1"), NodeKind::File))
+        .unwrap();
+    graph
+        .add_node(namespaced_node("b", "b.rs", Some("proj1"), NodeKind::File))
+        .unwrap();
+    graph.add_edge(test_edge("a", "b")).unwrap();
+    graph.compute_centrality();
+
+    // PageRank for non-existent namespace should be empty
+    let ranks = graph.pagerank_for_namespace("nonexistent", 0.85, 100, 1e-6);
+    assert!(ranks.is_empty());
+}
+
+#[test]
+fn pagerank_for_namespace_cross_namespace_edges_ignored() {
+    // a (proj1) --CALLS--> b (proj2)
+    // PageRank for proj1 should NOT flow to b
+    let mut graph = GraphEngine::new();
+    graph
+        .add_node(namespaced_node(
+            "a",
+            "fn_a",
+            Some("proj1"),
+            NodeKind::Function,
+        ))
+        .unwrap();
+    graph
+        .add_node(namespaced_node(
+            "b",
+            "fn_b",
+            Some("proj2"),
+            NodeKind::Function,
+        ))
+        .unwrap();
+    graph
+        .add_edge(typed_edge("a", "b", RelationshipType::Calls))
+        .unwrap();
+    graph.compute_centrality();
+
+    // PageRank for proj1 should only include a
+    let ranks = graph.pagerank_for_namespace("proj1", 0.85, 100, 1e-6);
+    assert_eq!(ranks.len(), 1);
+    assert!(ranks.contains_key("a"));
+    assert!(!ranks.contains_key("b"));
+
+    // PageRank for proj2 should only include b
+    let ranks = graph.pagerank_for_namespace("proj2", 0.85, 100, 1e-6);
+    assert_eq!(ranks.len(), 1);
+    assert!(!ranks.contains_key("a"));
+    assert!(ranks.contains_key("b"));
+}

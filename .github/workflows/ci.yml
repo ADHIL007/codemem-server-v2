@@ -1,0 +1,192 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Detect which files changed to skip irrelevant jobs
+  changes:
+    name: Detect Changes
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      ui: ${{ steps.filter.outputs.ui }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+            ui:
+              - 'ui/**'
+
+  fmt:
+    name: Format
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    strategy:
+      matrix:
+        os: [blacksmith-4vcpu-ubuntu-2404, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  coverage:
+    name: Rust Coverage
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v6
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: lcov.info
+          flags: rust
+          verbose: true
+          fail_ci_if_error: true
+
+  ui-lint:
+    name: UI Lint & Typecheck
+    needs: changes
+    if: ${{ needs.changes.outputs.ui == 'true' }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - run: bun run tsc --noEmit
+      - run: bun run eslint .
+
+  ui-build:
+    name: Build UI + Codemem Binary
+    needs: changes
+    if: ${{ needs.changes.outputs.ui == 'true' || needs.changes.outputs.rust == 'true' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install UI dependencies & build
+        working-directory: ui
+        run: bun install && bun run build
+
+      - name: Embed UI assets into codemem crate
+        run: rm -rf crates/codemem/ui-dist && cp -r ui/dist crates/codemem/ui-dist
+
+      - name: Build codemem release binary (with embedded UI)
+        run: cargo build --release -p codemem --features ui
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: codemem-binary
+          path: target/release/codemem
+          retention-days: 1
+
+  ui-test:
+    name: UI E2E Tests
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: [ui-build]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: bun install
+
+      - name: Download codemem binary
+        uses: actions/download-artifact@v8
+        with:
+          name: codemem-binary
+          path: target/release/
+
+      - name: Make binary executable
+        run: chmod +x target/release/codemem
+
+      - name: Install Playwright browsers
+        working-directory: ui
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright tests
+        working-directory: ui
+        run: npx playwright test
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: ui/test-results/
+
+  bench:
+    name: Benchmarks
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench -p codemem-bench --no-run

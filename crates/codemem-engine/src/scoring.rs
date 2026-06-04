@@ -1,0 +1,150 @@
+//! Hybrid scoring for memory recall.
+
+use crate::bm25;
+use chrono::{DateTime, Utc};
+use codemem_core::{GraphBackend, MemoryNode, ScoreBreakdown};
+
+// ── Code-graph sub-weights for `graph_strength_for_memory` ──────────────────
+
+/// Weight for PageRank in code-graph scoring.
+const CODE_GRAPH_W_PAGERANK: f64 = 0.4;
+/// Weight for betweenness centrality in code-graph scoring.
+const CODE_GRAPH_W_BETWEENNESS: f64 = 0.3;
+/// Weight for connectivity (degree / 5.0) in code-graph scoring.
+const CODE_GRAPH_W_CONNECTIVITY: f64 = 0.2;
+/// Weight for average edge weight in code-graph scoring.
+const CODE_GRAPH_W_EDGE_WEIGHT: f64 = 0.1;
+
+// ── Temporal decay constants ────────────────────────────────────────────────
+
+/// Half-life for temporal decay (hours). Updated-at age decays over 30 days.
+const TEMPORAL_DECAY_HOURS: f64 = 30.0 * 24.0;
+/// Half-life for recency decay (hours). Last-access age decays over 7 days.
+const RECENCY_DECAY_HOURS: f64 = 7.0 * 24.0;
+
+/// Compute graph strength for a memory node by combining raw graph metrics.
+///
+/// Blends two signal sources:
+/// - **Code neighbors** (`sym:`, `file:`, etc.): PageRank, betweenness, connectivity, edge weight
+/// - **Memory neighbors** (other memories linked via SHARES_THEME, PRECEDED_BY, etc.):
+///   connectivity count and average edge weight
+///
+/// A function with many linked memories ranks higher. A conversational memory
+/// connected to many session peers ranks higher than an isolated one.
+pub fn graph_strength_for_memory(graph: &dyn GraphBackend, memory_id: &str) -> f64 {
+    let metrics = match graph.raw_graph_metrics_for_memory(memory_id) {
+        Some(m) => m,
+        None => return 0.0,
+    };
+
+    // Code-graph component (0.0-1.0): centrality of linked code nodes
+    let code_score = if metrics.code_neighbor_count > 0 {
+        let connectivity = (metrics.code_neighbor_count as f64 / 5.0).min(1.0);
+        let avg_edge_w = (metrics.total_edge_weight / metrics.code_neighbor_count as f64).min(1.0);
+        CODE_GRAPH_W_PAGERANK * metrics.max_pagerank
+            + CODE_GRAPH_W_BETWEENNESS * metrics.max_betweenness
+            + CODE_GRAPH_W_CONNECTIVITY * connectivity
+            + CODE_GRAPH_W_EDGE_WEIGHT * avg_edge_w
+    } else {
+        0.0
+    };
+
+    // Memory-graph component (0.0-1.0): connectivity to other memories
+    let memory_score = if metrics.memory_neighbor_count > 0 {
+        let connectivity = (metrics.memory_neighbor_count as f64 / 10.0).min(1.0);
+        let avg_edge_w =
+            (metrics.memory_edge_weight / metrics.memory_neighbor_count as f64).min(1.0);
+        0.6 * connectivity + 0.4 * avg_edge_w
+    } else {
+        0.0
+    };
+
+    // Blend: when both exist, code neighbors dominate (70/30).
+    // When only one exists, use it fully.
+    let score = match (
+        metrics.code_neighbor_count > 0,
+        metrics.memory_neighbor_count > 0,
+    ) {
+        (true, true) => 0.7 * code_score + 0.3 * memory_score,
+        (true, false) => code_score,
+        (false, true) => memory_score,
+        (false, false) => 0.0,
+    };
+
+    score.min(1.0)
+}
+
+/// Re-export the canonical truncate from codemem-core.
+pub use codemem_core::truncate as truncate_content;
+
+/// Compute 9-component hybrid score for a memory against a query.
+/// The `graph` parameter is used to look up edge counts for graph strength scoring.
+/// The `bm25` parameter provides BM25-based token overlap scoring; if the memory
+/// is in the index it uses the indexed score, otherwise falls back to `score_text`.
+/// The `now` parameter makes scoring deterministic and testable by avoiding internal clock reads.
+pub fn compute_score(
+    memory: &MemoryNode,
+    query_tokens: &[&str],
+    vector_similarity: f64,
+    graph: &dyn GraphBackend,
+    bm25: &bm25::Bm25Index,
+    now: DateTime<Utc>,
+) -> ScoreBreakdown {
+    // BM25 token overlap (replaces naive split+intersect)
+    // Use pre-tokenized query tokens to avoid re-tokenizing per document.
+    let token_overlap = if query_tokens.is_empty() {
+        0.0
+    } else {
+        // Try indexed score first (memory already in the BM25 index),
+        // fall back to scoring against raw text for unindexed documents.
+        let indexed_score = bm25.score_with_tokens_str(query_tokens, &memory.id);
+        if indexed_score > 0.0 {
+            indexed_score
+        } else {
+            bm25.score_text_with_tokens_str(query_tokens, &memory.content)
+        }
+    };
+
+    // Temporal: how recently updated (exponential decay over 30 days)
+    let age_hours = (now - memory.updated_at).num_hours().max(0) as f64;
+    let temporal = (-age_hours / TEMPORAL_DECAY_HOURS).exp();
+
+    // Tag matching: fraction of query tokens found in tags.
+    // Per-memory `tags.join().to_lowercase()` is O(tags) which is typically <10 strings,
+    // so allocation is negligible.
+    let tag_matching = if !query_tokens.is_empty() {
+        let tag_str: String = memory.tags.join(" ").to_lowercase();
+        let matches = query_tokens
+            .iter()
+            .filter(|qt| tag_str.contains(**qt))
+            .count();
+        matches as f64 / query_tokens.len() as f64
+    } else {
+        0.0
+    };
+
+    // Recency: based on last access time (decay over 7 days)
+    let access_hours = (now - memory.last_accessed_at).num_hours().max(0) as f64;
+    let recency = (-access_hours / RECENCY_DECAY_HOURS).exp();
+
+    // Enhanced graph scoring: bridge memory UUIDs to code-graph centrality.
+    // Memory nodes live in a separate ID space from code nodes (sym:, file:),
+    // so we collect raw metrics from code-graph neighbors and apply the
+    // scoring formula here in the engine.
+    let graph_strength = graph_strength_for_memory(graph, &memory.id);
+
+    ScoreBreakdown {
+        vector_similarity,
+        graph_strength,
+        token_overlap,
+        temporal,
+        tag_matching,
+        importance: memory.importance,
+        confidence: memory.confidence,
+        recency,
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/scoring_tests.rs"]
+mod tests;

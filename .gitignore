@@ -1,0 +1,11 @@
+/target
+.codemem/
+.claude/
+.swarm/
+.mcp.json
+*.swp
+*.swo
+.DS_Store
+node_modules
+crates/codemem/ui-dist/
+rust-toolchain.toml
