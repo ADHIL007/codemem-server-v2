@@ -1,9 +1,10 @@
-# Codemem
+# Codemem Server v2
 
-[![CI](https://github.com/cogniplex/codemem/actions/workflows/ci.yml/badge.svg)](https://github.com/cogniplex/codemem/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/cogniplex/codemem/graph/badge.svg)](https://codecov.io/gh/cogniplex/codemem)
-[![Crates.io](https://img.shields.io/crates/v/codemem.svg)](https://crates.io/crates/codemem)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+> **Forked from [cogniplex/codemem](https://github.com/ADHIL007/codemem)** and enhanced with performance fixes, Copilot integration, and team server improvements.
+> 
+> VS Code extension: [ADHIL007/codemem-vscode](https://github.com/ADHIL007/codemem-vscode)
 
 A standalone Rust memory engine for AI coding assistants. Single binary, zero runtime deps.
 
@@ -34,28 +35,48 @@ From that point on, Codemem silently captures context, injects prior knowledge a
 
 ---
 
+## What's New in v2 (This Fork)
+
+### Server Performance
+
+| Change | Before | After |
+|--------|--------|-------|
+| Bulk edge ingest (50 edges) | 100s+ (504 timeout) | 30-600ms |
+| Centrality recompute | On every ingest chunk | Skipped during bulk ingest |
+| Dangling edge handling | Crash on startup | Skipped with warning |
+| Ingest logging | None | Per-phase timing (nodes, edges, graph lock, total) |
+
+### New Capabilities
+
+- **`Tests` RelationshipType** -- Extension can now send TESTS edges without 404 errors
+- **Improved `infer_node_kind`** -- Correctly handles `sym:`, `endpoint:`, `author:` prefixes and sub-kinds (`:class:`, `:function:`, `:method:`, `:interface:`, `:type:`, `:constant:`, `:test:`)
+- **Binds to `0.0.0.0`** -- Server accessible from other machines on the network (team server mode)
+- **Works with VS Code extension** -- Full integration with [codemem-vscode](https://github.com/ADHIL007/codemem-vscode) for on-save hooks, setup wizard, and Copilot instructions
+
+### VS Code Extension (companion)
+
+- **Copilot on-save hook** -- Every file save re-parses and uploads edges automatically
+- **Edge-hash dedup** -- Skips upload when edges haven't changed
+- **Setup wizard with persistence** -- 3-step onboarding survives restarts
+- **Copilot behavioral instructions** -- Tells Copilot to recall, search, and store decisions
+- **Status bar** -- Shows "indexing up to date" when fully configured
+
+---
+
 ## Quick Start
 
 ### Install
 
 ```bash
-# Shell (macOS/Linux)
-curl -fsSL https://raw.githubusercontent.com/cogniplex/codemem/main/install.sh | sh
+# From this repo
+git clone https://github.com/ADHIL007/codemem-server-v2.git
+cd codemem-server-v2
+cargo install --path crates/codemem
 
-# Homebrew
-brew install cogniplex/tap/codemem
-
-# Cargo
-cargo install codemem
+# Or build release binary
+cargo build --release
+# Binary at: target/release/codemem
 ```
-
-Or download a prebuilt binary from [Releases](https://github.com/cogniplex/codemem/releases).
-
-| Platform | Architecture | Binary |
-|----------|-------------|--------|
-| macOS | ARM64 (Apple Silicon) | `codemem-macos-arm64.tar.gz` |
-| Linux | x86_64 | `codemem-linux-amd64.tar.gz` |
-| Linux | ARM64 | `codemem-linux-arm64.tar.gz` |
 
 ### Initialize
 
@@ -408,8 +429,8 @@ Scoring weights, vector/graph tuning, embedding provider, memory expiration, and
 ## Building from Source
 
 ```bash
-git clone https://github.com/cogniplex/codemem.git
-cd codemem
+git clone https://github.com/ADHIL007/codemem-server-v2.git
+cd codemem-server-v2
 cargo build --release          # Optimized binary at target/release/codemem
 cargo test --workspace         # Run all tests
 cargo bench                    # Criterion benchmarks
@@ -462,6 +483,16 @@ Codemem builds on ideas from several research papers, blog posts, and open-sourc
 </details>
 
 See [docs/comparison.md](docs/comparison.md) for detailed feature comparisons.
+
+---
+
+## Related Repositories
+
+| Repository | Description |
+|------------|-------------|
+| [ADHIL007/codemem-server-v2](https://github.com/ADHIL007/codemem-server-v2) | This repo -- the enhanced CodeMem server |
+| [ADHIL007/codemem-vscode](https://github.com/ADHIL007/codemem-vscode) | VS Code extension (team edition) |
+| [cogniplex/codemem](https://github.com/ADHIL007/codemem) | Original upstream project |
 
 ## License
 
