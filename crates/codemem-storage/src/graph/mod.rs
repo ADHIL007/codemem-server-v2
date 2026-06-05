@@ -89,10 +89,18 @@ impl GraphEngine {
             engine.add_node(node)?;
         }
 
-        // Load all edges
+        // Load all edges — skip dangling edges where src/dst node is missing
         let edges = storage.all_graph_edges()?;
+        let mut skipped = 0usize;
         for edge in edges {
-            engine.add_edge(edge)?;
+            match engine.add_edge(edge) {
+                Ok(()) => {}
+                Err(CodememError::NotFound(_)) => skipped += 1,
+                Err(e) => return Err(e),
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(skipped, "from_storage: skipped dangling edges with missing nodes");
         }
 
         // Compute degree centrality so subgraph queries can rank nodes

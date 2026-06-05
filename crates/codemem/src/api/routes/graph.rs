@@ -163,7 +163,15 @@ pub async fn ingest_local_edges(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LocalEdgeIngestRequest>,
 ) -> Result<Json<LocalEdgeIngestResponse>, (StatusCode, Json<MessageResponse>)> {
+    let t0 = std::time::Instant::now();
+    tracing::info!(
+        namespace = %req.namespace.as_deref().unwrap_or("none"),
+        edge_count = req.edges.len(),
+        "ingest_local_edges: request received"
+    );
+
     if req.edges.is_empty() {
+        tracing::info!("ingest_local_edges: empty request, skipping");
         return Ok(Json(LocalEdgeIngestResponse {
             nodes_ingested: 0,
             edges_ingested: 0,
@@ -246,6 +254,8 @@ pub async fn ingest_local_edges(
     }
 
     let storage = state.server.storage();
+    let t_nodes = std::time::Instant::now();
+    tracing::info!(node_count = nodes.len(), "ingest_local_edges: inserting nodes into storage");
     if let Err(e) = storage.insert_graph_nodes_batch(&nodes) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -254,6 +264,10 @@ pub async fn ingest_local_edges(
             }),
         ));
     }
+    tracing::info!(elapsed_ms = t_nodes.elapsed().as_millis(), "ingest_local_edges: nodes stored");
+
+    let t_edges = std::time::Instant::now();
+    tracing::info!(edge_count = edges.len(), "ingest_local_edges: inserting edges into storage");
     if let Err(e) = storage.insert_graph_edges_batch(&edges) {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -262,7 +276,10 @@ pub async fn ingest_local_edges(
             }),
         ));
     }
+    tracing::info!(elapsed_ms = t_edges.elapsed().as_millis(), "ingest_local_edges: edges stored");
 
+    let t_lock = std::time::Instant::now();
+    tracing::info!("ingest_local_edges: locking in-memory graph");
     let mut graph = match state.server.engine.lock_graph() {
         Ok(g) => g,
         Err(e) => {
@@ -274,14 +291,25 @@ pub async fn ingest_local_edges(
             ))
         }
     };
+    tracing::info!(elapsed_ms = t_lock.elapsed().as_millis(), "ingest_local_edges: graph locked");
 
+    let t_mem = std::time::Instant::now();
     for node in &nodes {
         let _ = graph.add_node(node.clone());
     }
     for edge in &edges {
         let _ = graph.add_edge(edge.clone());
     }
-    graph.recompute_centrality_with_options(false);
+    tracing::info!(elapsed_ms = t_mem.elapsed().as_millis(), "ingest_local_edges: in-memory graph updated");
+    // Skip centrality recompute during bulk ingest — caller can trigger consolidation afterwards
+    drop(graph);
+
+    tracing::info!(
+        total_ms = t0.elapsed().as_millis(),
+        nodes = nodes.len(),
+        edges = edges.len(),
+        "ingest_local_edges: complete"
+    );
 
     Ok(Json(LocalEdgeIngestResponse {
         nodes_ingested: nodes.len(),
